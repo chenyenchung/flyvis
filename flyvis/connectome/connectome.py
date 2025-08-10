@@ -177,6 +177,16 @@ class ConnectomeFromAvgFilters(Directory):
 
         # Load the connectome spec.
         spec = json.loads(Path(file).read_text())
+        
+        # Extract node type parameters (dropout and compensate)
+        node_type_params = {}
+        for node in spec["nodes"]:
+            dropout = node.get("dropout", 0.0)
+            compensate = node.get("compensate", 0.0)
+            node_type_params[node["name"]] = {
+                "dropout": dropout,
+                "compensate": compensate
+            }
 
         # Store unique cell types and layout variables.
         self.unique_cell_types = np.bytes_([n["name"] for n in spec["nodes"]])
@@ -225,6 +235,27 @@ class ConnectomeFromAvgFilters(Directory):
         edges: List[Edge] = []
         add_nodes(nodes, spec["nodes"], extent)
         add_edges(edges, nodes, spec["edges"], n_syn_fill)
+        
+        # Apply edge weight compensation based on node type dropout and compensate values
+        for edge in edges:
+            source_params = node_type_params.get(edge.source.type, {"dropout": 0.0, "compensate": 0.0})
+            target_params = node_type_params.get(edge.target.type, {"dropout": 0.0, "compensate": 0.0})
+            
+            # Apply compensation if source node type has dropout and compensate
+            if source_params["dropout"] > 0 and source_params["compensate"] > 0:
+                if source_params["dropout"] == 1.0:
+                    multiplier = 0.0  # Avoid division by zero
+                else:
+                    multiplier = source_params["compensate"] / (1 - source_params["dropout"])
+                edge.n_syn *= multiplier
+            
+            # Apply compensation if target node type has dropout and compensate
+            if target_params["dropout"] > 0 and target_params["compensate"] > 0:
+                if target_params["dropout"] == 1.0:
+                    multiplier = 0.0  # Avoid division by zero
+                else:
+                    multiplier = target_params["compensate"] / (1 - target_params["dropout"])
+                edge.n_syn *= multiplier
 
         # Define node roles (input, intermediate, output).
         _role = {node: "intermediate" for node in set([n.type for n in nodes])}
@@ -315,16 +346,17 @@ def add_nodes(seq: List[Node], node_spec: dict, extent: int) -> None:
     """
     for n in node_spec:
         typ, (pattern, args) = n["name"], n["pattern"]
+        dropout = n.get("dropout", 0.0)  # Extract optional dropout value
         if pattern == "stride":
-            add_strided_nodes(seq, typ, extent, args)
+            add_strided_nodes(seq, typ, extent, args, dropout)
         elif pattern == "tile":
-            add_tiled_nodes(seq, typ, extent, args)
+            add_tiled_nodes(seq, typ, extent, args, dropout)
         elif pattern == "single":
-            add_single_node(seq, typ, extent)
+            add_single_node(seq, typ, extent, dropout)
 
 
 def add_strided_nodes(
-    seq: List[Node], typ: str, extent: int, strides: Tuple[int, int]
+    seq: List[Node], typ: str, extent: int, strides: Tuple[int, int], dropout: float = 0.0
 ) -> None:
     """Add to `seq` a population of neurons arranged in a hexagonal grid.
 
@@ -333,16 +365,39 @@ def add_strided_nodes(
         typ: Cell type name.
         extent: The array radius, in columns.
         strides: Tuple of (u_stride, v_stride).
+        dropout: Optional dropout rate (0.0 to 1.0). If > 0, removes nodes at regular intervals.
     """
     n = extent
     u_stride, v_stride = strides
+    
+    # First, collect all candidate nodes
+    temp_nodes = []
     for u in range(-n, n + 1):
         for v in range(max(-n, -n - u), min(n, n - u) + 1):
             if u % u_stride == 0 and v % v_stride == 0:
-                seq.append(Node(len(seq), typ, u, v, u_stride, v_stride))
+                temp_nodes.append((u, v))
+    
+    # Apply dropout if specified
+    if dropout > 0:
+        # Sort nodes by (u, v) for consistent traversal order
+        temp_nodes.sort(key=lambda node: (node[0], node[1]))
+        k = round(1 / dropout) if dropout > 0 else float('inf')
+        # Remove every k-th node (indices 0, k, 2k, ...)
+        temp_nodes = [node for i, node in enumerate(temp_nodes) if i % k != 0]
+
+    if dropout > 0.5:
+        # Sort nodes by (u, v) for consistent traversal order
+        temp_nodes.sort(key=lambda node: (node[0], node[1]))
+        k = round(1 / (1 - dropout)) if dropout < 1 else float('inf')
+        # Remove every k-th node (indices 0, k, 2k, ...)
+        temp_nodes = [node for i, node in enumerate(temp_nodes) if i % k == 0]
+    
+    # Add surviving nodes to the sequence
+    for u, v in temp_nodes:
+        seq.append(Node(len(seq), typ, u, v, u_stride, v_stride))
 
 
-def add_tiled_nodes(seq: List[Node], typ: str, extent: int, n: int) -> None:
+def add_tiled_nodes(seq: List[Node], typ: str, extent: int, n: int, dropout: float = 0.0) -> None:
     """Add to `seq` a population of neurons with strides `(n, n)`.
 
     Args:
@@ -350,19 +405,22 @@ def add_tiled_nodes(seq: List[Node], typ: str, extent: int, n: int) -> None:
         typ: Cell type name.
         extent: The array radius, in columns.
         n: Stride value for both u and v.
+        dropout: Optional dropout rate (0.0 to 1.0).
     """
-    add_strided_nodes(seq, typ, extent, (n, n))
+    add_strided_nodes(seq, typ, extent, (n, n), dropout)
 
 
-def add_single_node(seq: List[Node], typ: str, extent: int) -> None:
+def add_single_node(seq: List[Node], typ: str, extent: int, dropout: float = 0.0) -> None:
     """Add to `seq` a single-neuron population.
 
     Args:
         seq: List to append nodes to.
         typ: Cell type name.
         extent: The array radius, in columns.
+        dropout: Optional dropout rate (0.0 to 1.0). Note: Has no effect for single nodes.
     """
-    add_strided_nodes(seq, typ, 0, (1, 1))
+    # For single nodes, dropout doesn't apply since there's only one node
+    add_strided_nodes(seq, typ, 0, (1, 1), 0.0)
 
 
 # -- Edge construction ---------------------------------------------------------
