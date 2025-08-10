@@ -10,6 +10,7 @@ Info: Rationale
 import logging
 import os
 import warnings
+import numpy as np
 from typing import Any, List
 
 import xarray as xr
@@ -55,8 +56,60 @@ class H5XArrayDatasetStoreBackend(FileSystemStoreBackend):
                 self.create_location(os.path.dirname(nc_path))
                 logger.info("Store item %s", nc_path)
                 # Ensure mode='w' by default but allow override through kwargs
+                encoding = {}
+                # Handle coordinates
+                for coord_name in item.coords:
+                    coord = item.coords[coord_name]
+                    if hasattr(coord, 'dtype') and np.issubdtype(coord.dtype, np.integer):
+                        encoding[coord_name] = {'dtype': 'int64'}
+
+                # Handle data variables
+                for var_name in item.data_vars:
+                    var = item[var_name]
+                    if hasattr(var, 'dtype'):
+                        if np.issubdtype(var.dtype, np.integer):
+                            encoding[var_name] = {'dtype': 'int64'}
+                        elif var.dtype == np.float64:
+                            # Optionally reduce float64 to float32 to save space
+                            encoding[var_name] = {'dtype': 'float32'}
+                
+                # Handle attributes with large integers
+                # Since HDF5 attributes have limitations, we need special handling
+                import json
+                
+                # Create a copy with serializable attributes
+                fixed_item = item.copy()
+                fixed_attrs = {}
+                
+                for key, value in item.attrs.items():
+                    if isinstance(value, (int, np.integer)):
+                        # Check if it exceeds int32
+                        if abs(int(value)) > 2147483647:
+                            # Store as string with marker
+                            fixed_attrs[key] = f"BIGINT:{value}"
+                        else:
+                            fixed_attrs[key] = int(value)
+                    elif isinstance(value, dict):
+                        # Serialize dict, handling large integers
+                        def handle_large_ints(obj):
+                            if isinstance(obj, (int, np.integer)) and abs(int(obj)) > 2147483647:
+                                return f"BIGINT:{obj}"
+                            elif isinstance(obj, dict):
+                                return {k: handle_large_ints(v) for k, v in obj.items()}
+                            elif isinstance(obj, list):
+                                return [handle_large_ints(i) for i in obj]
+                            return obj
+                        
+                        fixed_dict = handle_large_ints(value)
+                        fixed_attrs[key] = json.dumps(fixed_dict)
+                    else:
+                        fixed_attrs[key] = value
+                
+                fixed_item.attrs = fixed_attrs
+                
                 kwargs.setdefault('mode', 'w')
-                item.to_netcdf(nc_path)
+                fixed_item.to_netcdf(nc_path, encoding=encoding)
+                
             except Exception as e:
                 warnings.warn(
                     f"Unable to cache Dataset to h5. Exception: {e}.",
@@ -92,7 +145,41 @@ class H5XArrayDatasetStoreBackend(FileSystemStoreBackend):
             if verbose > 1:
                 logger.info('Loading Dataset from h5 at %s', nc_path)
             try:
-                return xr.open_dataset(nc_path)
+                item = xr.open_dataset(nc_path)
+                
+                # Restore large integers in attributes
+                import json
+                fixed_attrs = {}
+                
+                for key, value in item.attrs.items():
+                    if isinstance(value, str):
+                        if value.startswith("BIGINT:"):
+                            # Restore large integer
+                            fixed_attrs[key] = int(value[7:])
+                        elif value.startswith('{') or value.startswith('['):
+                            # Try to parse JSON and restore large ints
+                            try:
+                                parsed = json.loads(value)
+                                
+                                def restore_large_ints(obj):
+                                    if isinstance(obj, str) and obj.startswith("BIGINT:"):
+                                        return int(obj[7:])
+                                    elif isinstance(obj, dict):
+                                        return {k: restore_large_ints(v) for k, v in obj.items()}
+                                    elif isinstance(obj, list):
+                                        return [restore_large_ints(i) for i in obj]
+                                    return obj
+                                
+                                fixed_attrs[key] = restore_large_ints(parsed)
+                            except:
+                                fixed_attrs[key] = value
+                        else:
+                            fixed_attrs[key] = value
+                    else:
+                        fixed_attrs[key] = value
+                
+                item.attrs = fixed_attrs
+                return item
             except Exception as e:
                 warnings.warn(
                     f"Unable to load Dataset from h5. Exception: {e}.",
