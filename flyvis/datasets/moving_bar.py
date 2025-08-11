@@ -195,10 +195,15 @@ class MovingBar(StimulusDataset):
         self.n_bars = 1
         self.bar_loc_horizontal = bar_loc_horizontal
 
-        self.t_stim = (len(self.offsets) * self.led_width) / (
+        # Calculate original variable durations
+        original_t_stim = (len(self.offsets) * self.led_width) / (
             self.speeds * self.omm_width
         )
-        self.t_stim_max = np.max(self.t_stim)
+        
+        # Use fixed duration equal to the slowest (longest) speed
+        self.t_stim_max = np.max(original_t_stim)
+        # All speeds now use the same duration - the longest one
+        self.t_stim = np.full_like(self.speeds, self.t_stim_max)
 
         self._speed_to_t_stim = dict(zip(self.speeds, self.t_stim))
 
