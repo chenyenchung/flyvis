@@ -304,7 +304,6 @@ def moving_edge_responses(
         'height': 80,
         'post_pad_mode': "continue",
         'dt': dt,
-        'device': flyvis.device,
         't_pre': 1.0,
         't_post': 1.0,
     }
@@ -338,7 +337,6 @@ def moving_bar_responses(
         'dt': dt,
         't_pre': 1.0,
         't_post': 1.0,
-        'device': flyvis.device,
     }
     return generic_responses(
         network_view_or_ensemble,
@@ -403,7 +401,6 @@ def central_impulses_responses(
         't_post': 0,
         'intensity': intensity,
         'mode': "impulse",
-        'device': flyvis.device,
     }
     return generic_responses(
         network_view_or_ensemble,
@@ -441,7 +438,6 @@ def spatial_impulses_responses(
         't_post': 0,
         'intensity': intensity,
         'mode': "impulse",
-        'device': flyvis.device,
     }
     return generic_responses(
         network_view_or_ensemble,
