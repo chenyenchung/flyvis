@@ -84,6 +84,10 @@ class Embedding:
         plot_mode: str = "paper",
         fontsize: int = 5,
         colors: npt.NDArray = None,
+        show_colorbar: bool = False,
+        colorbar_label: Optional[str] = None,
+        categorical: bool = False,
+        category_labels: Optional[List[str]] = None,
         **kwargs,
     ) -> tuple[Figure, Axes]:
         """
@@ -96,6 +100,10 @@ class Embedding:
             plot_mode: Mode for plotting ('paper', 'small', or 'large').
             fontsize: Font size for annotations.
             colors: Colors for data points.
+            show_colorbar: Whether to show a colorbar legend.
+            colorbar_label: Label for the colorbar (if shown).
+            categorical: Whether to treat colors as categorical (discrete legend) vs continuous.
+            category_labels: Custom text labels for categorical color values.
             **kwargs: Additional arguments passed to plot_embedding.
 
         Returns:
@@ -122,6 +130,10 @@ class Embedding:
             mode=plot_mode,
             figsize=figsize,
             fontsize=fontsize,
+            show_colorbar=show_colorbar,
+            colorbar_label=colorbar_label,
+            categorical=categorical,
+            category_labels=category_labels,
             **kwargs,
         )
 
@@ -225,6 +237,10 @@ class GaussianMixtureClustering:
         figsize: tuple = None,
         plot_mode: str = "paper",
         fontsize: int = 5,
+        show_colorbar: bool = False,
+        colorbar_label: Optional[str] = None,
+        categorical: bool = False,
+        category_labels: Optional[List[str]] = None,
         **kwargs,
     ) -> "EmbeddingPlot":
         """
@@ -240,6 +256,10 @@ class GaussianMixtureClustering:
             figsize: Size of the figure.
             plot_mode: Mode for plotting ('paper', 'small', or 'large').
             fontsize: Font size for annotations.
+            show_colorbar: Whether to show a colorbar legend.
+            colorbar_label: Label for the colorbar (if shown).
+            categorical: Whether to treat colors as categorical (discrete legend) vs continuous.
+            category_labels: Custom text labels for categorical color values.
             **kwargs: Additional arguments for plot_embedding function.
 
         Returns:
@@ -270,6 +290,10 @@ class GaussianMixtureClustering:
             range_n_clusters=self.range_n_clusters,
             n_init_gaussian_mixture=self.n_init,
             gm_kwargs=self.kwargs,
+            show_colorbar=show_colorbar,
+            colorbar_label=colorbar_label,
+            categorical=categorical,
+            category_labels=category_labels,
             **kwargs,
         )
         if annotate_scores:
@@ -402,11 +426,56 @@ def gaussian_mixture(
 class EnsembleEmbedding:
     """Embedding of the ensemble responses.
 
-    Args: responses (CentralActivity): CentralActivity object
+    Args: 
+        responses (CentralActivity or List[CentralActivity]): Single CentralActivity object 
+            or list of CentralActivity objects for joint embedding across multiple ensembles.
     """
 
-    def __init__(self, responses: CentralActivity):
-        self.responses = responses
+    def __init__(self, responses: Union[CentralActivity, List[CentralActivity]]):
+        # Handle both single CentralActivity and list of CentralActivity objects
+        if isinstance(responses, list):
+            self.responses_list = responses
+            self.is_multi_ensemble = True
+        else:
+            self.responses_list = [responses]
+            self.is_multi_ensemble = False
+        
+        # Validate that all CentralActivity objects have compatible cell types
+        self._validate_cell_type_compatibility()
+
+    def _validate_cell_type_compatibility(self):
+        """Check that all CentralActivity objects have the same cell types available."""
+        if len(self.responses_list) <= 1:
+            return
+        
+        reference_cell_types = set(self.responses_list[0].unique_cell_types)
+        for i, responses in enumerate(self.responses_list[1:], 1):
+            current_cell_types = set(responses.unique_cell_types)
+            if reference_cell_types != current_cell_types:
+                missing_in_current = reference_cell_types - current_cell_types
+                missing_in_reference = current_cell_types - reference_cell_types
+                warning_msg = f"CentralActivity object {i} has different cell types than the first one."
+                if missing_in_current:
+                    warning_msg += f" Missing in object {i}: {missing_in_current}."
+                if missing_in_reference:
+                    warning_msg += f" Missing in object 0: {missing_in_reference}."
+                import warnings
+                warnings.warn(warning_msg)
+
+    def _get_joint_responses_for_cell_type(self, cell_type: str) -> np.ndarray:
+        """Get concatenated responses for a specific cell type across all CentralActivity objects."""
+        all_responses = []
+        
+        for responses in self.responses_list:
+            if cell_type not in responses.unique_cell_types:
+                raise ValueError(f"Cell type '{cell_type}' not found in one of the CentralActivity objects")
+            
+            cell_responses = responses[cell_type]
+            all_responses.append(cell_responses)
+        
+        # Concatenate along the first axis (models/samples)
+        joint_responses = np.concatenate(all_responses, axis=0)
+        return joint_responses
 
     def from_cell_type(
         self,
@@ -414,9 +483,34 @@ class EnsembleEmbedding:
         embedding_kwargs=None,
     ) -> Embedding:
         """Umap Embedding of the responses of a specific cell type."""
-
+        
         embedding_kwargs = embedding_kwargs or {}
-        return Embedding(*umap_embedding(self.responses[cell_type], **embedding_kwargs))
+        
+        if self.is_multi_ensemble:
+            # Get joint responses across all CentralActivity objects
+            joint_responses = self._get_joint_responses_for_cell_type(cell_type)
+            return Embedding(*umap_embedding(joint_responses, **embedding_kwargs))
+        else:
+            # Original single CentralActivity behavior
+            return Embedding(*umap_embedding(self.responses_list[0][cell_type], **embedding_kwargs))
+
+    def get_source_labels(self) -> Optional[np.ndarray]:
+        """Get labels indicating which source ensemble each sample came from.
+        
+        Returns:
+            Array of source labels, or None if only single ensemble.
+        """
+        if not self.is_multi_ensemble:
+            return None
+        
+        source_labels = []
+        for source_idx, responses in enumerate(self.responses_list):
+            # Get number of samples from the first available cell type
+            first_cell_type = responses.unique_cell_types[0]
+            n_samples = responses[first_cell_type].shape[0]
+            source_labels.extend([source_idx] * n_samples)
+        
+        return np.array(source_labels)
 
     def __call__(
         self,
@@ -528,6 +622,10 @@ def plot_embedding(
     err_x_offset: float = 0.025,
     err_y_offset: float = -0.025,
     gm_kwargs: Optional[Dict] = None,
+    show_colorbar: bool = False,
+    colorbar_label: Optional[str] = None,
+    categorical: bool = False,
+    category_labels: Optional[List[str]] = None,
 ) -> Tuple[Figure, Axes]:
     """
     Plot the embedding of data points with optional Gaussian mixture clustering.
@@ -556,6 +654,10 @@ def plot_embedding(
         err_x_offset: X-offset for error annotations.
         err_y_offset: Y-offset for error annotations.
         gm_kwargs: Additional keyword arguments for Gaussian mixture.
+        show_colorbar: Whether to show a colorbar legend.
+        colorbar_label: Label for the colorbar (if shown).
+        categorical: Whether to treat colors as categorical (discrete legend) vs continuous.
+        category_labels: Custom text labels for categorical color values.
 
     Returns:
         A tuple containing the figure and axes objects.
@@ -593,6 +695,9 @@ def plot_embedding(
     yc = X[:, 1]
     x_min, x_max = plt_utils.get_lims(xc, ax_lim_pad)
     y_min, y_max = plt_utils.get_lims(yc, ax_lim_pad)
+    
+    # Initialize scatter_plot to None - will be set if we create a single scatter plot
+    scatter_plot = None
 
     if fit_gaussians:
         # breakpoint()
@@ -709,13 +814,110 @@ def plot_embedding(
                 )
     else:
         X = X[mask]
-        ax.scatter(X[:, 0], X[:, 1], c=colors, s=s, alpha=0.6, edgecolors="none")
+        scatter_plot = ax.scatter(X[:, 0], X[:, 1], c=colors, s=s, alpha=0.6, edgecolors="none")
 
     ax.set_xlim(x_min, x_max)
     ax.set_ylim(y_min, y_max)
 
     ax.set_title(title, fontsize=fontsize)
     plt_utils.rm_spines(ax)
+
+    # Add colorbar or legend if requested
+    if show_colorbar:
+        if labels is not None:
+            # Categorical legend for clustered data (with cluster markers)
+            from matplotlib.patches import Patch
+            
+            # Create legend showing clusters with their markers and colors
+            legend_elements = []
+            # By this point, labels and colors have already been filtered by mask
+            unique_labels = np.unique(labels)
+            MARKERS = check_markers(len(unique_labels))
+            
+            for i, label in enumerate(unique_labels.astype(int)):
+                # Get representative color for this cluster
+                if colors is not None:
+                    cluster_mask = labels == label
+                    if cluster_mask.any():
+                        # Use the first color in this cluster as representative
+                        cluster_color = colors[cluster_mask][0]
+                    else:
+                        cluster_color = 'gray'
+                else:
+                    cluster_color = 'gray'
+                
+                legend_elements.append(
+                    plt.Line2D([0], [0], marker=MARKERS[label], color='w', 
+                              markerfacecolor=cluster_color, markersize=8,
+                              label=f'Cluster {label}', linestyle='None')
+                )
+            
+            ax.legend(handles=legend_elements, fontsize=fontsize, 
+                     title=colorbar_label, title_fontsize=fontsize)
+                     
+        elif colors is not None:
+            # Handle colors based on categorical parameter
+            if categorical:
+                # Force categorical legend
+                from matplotlib.patches import Patch
+                
+                unique_colors = np.unique(colors)
+                legend_elements = []
+                
+                for i, color_val in enumerate(unique_colors):
+                    # Determine the label to show
+                    if category_labels is not None and i < len(category_labels):
+                        label_text = category_labels[i]
+                    else:
+                        label_text = str(color_val)
+                    
+                    # Create legend entry with appropriate color
+                    # If color_val is numeric, map to colormap; otherwise use as direct color
+                    try:
+                        # Try to use as matplotlib color first
+                        legend_elements.append(
+                            Patch(facecolor=color_val, label=label_text)
+                        )
+                    except (ValueError, TypeError):
+                        # If not a valid color, use colormap index
+                        import matplotlib.cm as cm
+                        cmap = cm.get_cmap('viridis')
+                        color_mapped = cmap(i / max(1, len(unique_colors) - 1))
+                        legend_elements.append(
+                            Patch(facecolor=color_mapped, label=label_text)
+                        )
+                
+                ax.legend(handles=legend_elements, fontsize=fontsize,
+                         title=colorbar_label, title_fontsize=fontsize)
+            else:
+                # Try continuous colorbar first
+                try:
+                    # Test if colors can be interpreted as numeric values
+                    colors_numeric = np.array(colors, dtype=float)
+                    
+                    # If successful and not all NaN, create continuous colorbar from actual scatter
+                    if not np.isnan(colors_numeric).all() and scatter_plot is not None:
+                        cbar = plt.colorbar(scatter_plot, ax=ax)
+                        if colorbar_label:
+                            cbar.set_label(colorbar_label, fontsize=fontsize)
+                        cbar.ax.tick_params(labelsize=fontsize)
+                    else:
+                        # Fallback to categorical if continuous fails
+                        from matplotlib.patches import Patch
+                        unique_colors = np.unique(colors)[:10]  # Limit to 10 items
+                        legend_elements = [Patch(facecolor='gray', label=str(color)) 
+                                         for color in unique_colors]
+                        ax.legend(handles=legend_elements, fontsize=fontsize,
+                                 title=colorbar_label, title_fontsize=fontsize)
+                        
+                except (ValueError, TypeError):
+                    # Fallback to categorical legend
+                    from matplotlib.patches import Patch
+                    unique_colors = list(set(colors))[:10]  # Limit to 10 items
+                    legend_elements = [Patch(facecolor='gray', label=str(color)) 
+                                     for color in unique_colors]
+                    ax.legend(handles=legend_elements, fontsize=fontsize,
+                             title=colorbar_label, title_fontsize=fontsize)
 
     return fig, ax
 
