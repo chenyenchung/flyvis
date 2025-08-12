@@ -185,3 +185,10 @@ import_profile*
 docs/site/
 *.dev
 dev
+
+# Singularity-related
+*.ext3
+*.sif
+
+# Exploration
+ipynb
