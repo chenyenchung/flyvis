@@ -122,6 +122,7 @@ class CentralActivity(CellTypeActivity):
         activity: Activity of shape (..., n_cells).
         connectome: Connectome directory with reference to required attributes.
         keepref: Whether to keep a reference to the activity.
+        use_mask: If True, mask out non-existent neurons in ragged arrays.
 
     Attributes:
         activity: Activity of shape (..., n_cells).
@@ -136,45 +137,78 @@ class CentralActivity(CellTypeActivity):
         activity: Union[NDArray, torch.Tensor],
         connectome: ConnectomeFromAvgFilters,
         keepref: bool = False,
+        use_mask: bool = True,
     ):
         super().__init__(keepref)
+        self.use_mask = use_mask  # If False, padding will be applied for ragged arrays
         self.index = nodes_edges_utils.NodeIndexer(connectome)
 
         unique_cell_types = connectome.unique_cell_types[:]
         input_cell_types = connectome.input_cell_types[:]
         output_cell_types = connectome.output_cell_types[:]
-        self.input_indices = np.array([
-            np.nonzero(unique_cell_types == t)[0] for t in input_cell_types
-        ])
-        self.output_indices = np.array([
-            np.nonzero(unique_cell_types == t)[0] for t in output_cell_types
-        ])
+        
+        # Create padded indices with validity masks (same logic as LayerActivity)
+        self._create_central_padded_indices(unique_cell_types, input_cell_types, output_cell_types)
+        
         self.activity = activity
         self.unique_cell_types = unique_cell_types.astype(str)
 
     def __getattr__(self, key):
+        """Override to handle padding and masking for CentralActivity."""
         activity = self.activity() if not self.keepref else self.activity
         if activity is None:
             return
+        
+        # Handle padding for CentralActivity (uses central cells, so activity shape matches central neurons)
+        if hasattr(self, 'output_mask') and hasattr(self, 'input_mask'):
+            # For CentralActivity, we work with central cells, so we need to pad based on central activity size
+            n_central = len(self.index.central_cells_index)
+            if activity.shape[-1] == n_central:
+                if isinstance(activity, torch.Tensor):
+                    zeros = torch.zeros((*activity.shape[:-1], 1), dtype=activity.dtype, device=activity.device)
+                    padded_activity = torch.cat([activity, zeros], dim=-1)
+                else:
+                    padded_activity = np.concatenate([activity, np.zeros((*activity.shape[:-1], 1))], axis=-1)
+            else:
+                padded_activity = activity
+        else:
+            padded_activity = activity
+        
         if isinstance(key, list):
             index = np.stack(list(map(lambda key: self.index[key], key)))
-            slices = self._slices(len(activity.shape) - 1)
+            slices = self._slices(len(padded_activity.shape) - 1)
             slices += (index,)
-            return activity[slices]
+            return padded_activity[slices]
         elif key == slice(None):
-            return activity
+            return padded_activity
         elif key in self.index.unique_cell_types:
-            slices = self._slices(len(activity.shape) - 1)
+            slices = self._slices(len(padded_activity.shape) - 1)
             slices += (self.index[key],)
-            return activity[slices]
+            return padded_activity[slices]
         elif key == "output":
-            slices = self._slices(len(activity.shape) - 1)
+            slices = self._slices(len(padded_activity.shape) - 1)
             slices += (self.output_indices,)
-            return activity[slices]
+            result = padded_activity[slices]
+            # Apply masking if use_mask=True
+            if self.use_mask and hasattr(self, 'output_mask'):
+                mask_shape = [1] * (len(result.shape) - 2) + list(self.output_mask.shape)
+                expanded_mask = self.output_mask.reshape(mask_shape)
+                if isinstance(result, torch.Tensor):
+                    expanded_mask = torch.from_numpy(expanded_mask).to(result.device, dtype=result.dtype)
+                result = result * expanded_mask
+            return result
         elif key == "input":
-            slices = self._slices(len(activity.shape) - 1)
+            slices = self._slices(len(padded_activity.shape) - 1)
             slices += (self.input_indices,)
-            return activity[slices]
+            result = padded_activity[slices]
+            # Apply masking if use_mask=True
+            if self.use_mask and hasattr(self, 'input_mask'):
+                mask_shape = [1] * (len(result.shape) - 2) + list(self.input_mask.shape)
+                expanded_mask = self.input_mask.reshape(mask_shape)
+                if isinstance(result, torch.Tensor):
+                    expanded_mask = torch.from_numpy(expanded_mask).to(result.device, dtype=result.dtype)
+                result = result * expanded_mask
+            return result
         elif key in self.__dict__:
             return self.__dict__[key]
         else:
@@ -182,11 +216,14 @@ class CentralActivity(CellTypeActivity):
 
     def __setattr__(self, key, value):
         if key == "activity" and value is not None:
-            if len(self.index.unique_cell_types) != value.shape[-1]:
-                slices = self._slices(len(value.shape) - 1)
+            # Handle the case where value might be a weakref
+            actual_value = value() if hasattr(value, '__call__') and hasattr(value, '__weakref__') else value
+            if hasattr(actual_value, 'shape') and len(self.index.unique_cell_types) != actual_value.shape[-1]:
+                slices = self._slices(len(actual_value.shape) - 1)
                 slices += (self.index.central_cells_index,)
-                value = value[slices]
+                actual_value = actual_value[slices]
                 self.keepref = True
+                value = actual_value
             if self.keepref is False:
                 value = weakref.ref(value)
             object.__setattr__(self, key, value)
@@ -200,6 +237,35 @@ class CentralActivity(CellTypeActivity):
         for cell_type in self.unique_cell_types:
             yield cell_type
 
+    def _create_central_padded_indices(self, unique_cell_types, input_cell_types, output_cell_types):
+        """Create padded indices arrays with validity masks for CentralActivity."""
+        # Create variable-length index lists
+        input_indices_list = [np.nonzero(unique_cell_types == t)[0] for t in input_cell_types]
+        output_indices_list = [np.nonzero(unique_cell_types == t)[0] for t in output_cell_types]
+        
+        # Handle empty lists
+        if input_indices_list:
+            max_input_len = max(len(arr) for arr in input_indices_list)
+            self.input_indices = np.full((len(input_indices_list), max_input_len), unique_cell_types.shape[0], dtype=int)
+            self.input_mask = np.zeros((len(input_indices_list), max_input_len), dtype=bool)
+            for i, arr in enumerate(input_indices_list):
+                self.input_indices[i, :len(arr)] = arr
+                self.input_mask[i, :len(arr)] = True
+        else:
+            self.input_indices = np.array([]).astype(int)
+            self.input_mask = np.array([]).astype(bool)
+            
+        if output_indices_list:
+            max_output_len = max(len(arr) for arr in output_indices_list)
+            self.output_indices = np.full((len(output_indices_list), max_output_len), unique_cell_types.shape[0], dtype=int)
+            self.output_mask = np.zeros((len(output_indices_list), max_output_len), dtype=bool)
+            for i, arr in enumerate(output_indices_list):
+                self.output_indices[i, :len(arr)] = arr
+                self.output_mask[i, :len(arr)] = True
+        else:
+            self.output_indices = np.array([]).astype(int)
+            self.output_mask = np.array([]).astype(bool)
+
 
 class LayerActivity(CellTypeActivity):
     """Attribute-style access to hex-lattice activity (cell-type specific).
@@ -209,6 +275,11 @@ class LayerActivity(CellTypeActivity):
         connectome: Connectome directory with reference to required attributes.
         keepref: Whether to keep a reference to the activity.
         use_central: Whether to use central activity.
+        use_mask: If True, mask out non-existent neurons in ragged arrays.
+                 If False, padding will be applied for uniform tensor shapes.
+                 Training/validation should use use_mask=False for decoder
+                 compatibility. Analysis should use use_mask=True to avoid
+                 contamination from padded neurons.
 
     Attributes:
         central: CentralActivity instance for central nodes.
@@ -247,13 +318,15 @@ class LayerActivity(CellTypeActivity):
         connectome: ConnectomeFromAvgFilters,
         keepref: bool = False,
         use_central: bool = True,
+        use_mask: bool = True,
     ):
         super().__init__(keepref)
         self.keepref = keepref
+        self.use_mask = use_mask  # If False, padding will be applied for ragged arrays
 
         self.use_central = use_central
         if use_central:
-            self.central = CentralActivity(activity, connectome, keepref)
+            self.central = CentralActivity(activity, connectome, keepref, use_mask)
 
         self.activity = activity
         self.connectome = connectome
@@ -262,28 +335,119 @@ class LayerActivity(CellTypeActivity):
             index = connectome.nodes.layer_index[cell_type][:]
             self[cell_type] = index
 
-        _cell_types = self.connectome.nodes.type[:]
-        self.input_indices = np.array([
-            np.nonzero(_cell_types == t)[0] for t in self.connectome.input_cell_types
-        ])
-        self.output_indices = np.array([
-            np.nonzero(_cell_types == t)[0] for t in self.connectome.output_cell_types
-        ])
+        # Create padded indices with validity masks
+        self._create_padded_indices_with_masks()
+        
         self.input_cell_types = self.connectome.input_cell_types[:].astype(str)
         self.output_cell_types = self.connectome.output_cell_types[:].astype(str)
         self.n_nodes = len(self.connectome.nodes.type)
 
     def __setattr__(self, key, value):
         if key == "activity" and value is not None:
+            original_value = value  # Keep reference to original before weakref
+            
+            if self.use_central:
+                self.central.__setattr__(key, original_value)  # Pass original value to central
+            
             if self.keepref is False:
                 value = weakref.ref(value)
-
-            if self.use_central:
-                self.central.__setattr__(key, value)
 
             object.__setattr__(self, key, value)
         else:
             object.__setattr__(self, key, value)
+
+    def _create_padded_indices_with_masks(self):
+        """Create padded indices arrays with validity masks for handling ragged arrays."""
+        _cell_types = self.connectome.nodes.type[:]
+        
+        # Create variable-length index lists
+        input_indices_list = [np.nonzero(_cell_types == t)[0] for t in self.connectome.input_cell_types]
+        output_indices_list = [np.nonzero(_cell_types == t)[0] for t in self.connectome.output_cell_types]
+        
+        # Handle empty lists
+        if input_indices_list:
+            max_input_len = max(len(arr) for arr in input_indices_list)
+            self.input_indices = np.full((len(input_indices_list), max_input_len), _cell_types.shape[0], dtype=int)
+            self.input_mask = np.zeros((len(input_indices_list), max_input_len), dtype=bool)
+            for i, arr in enumerate(input_indices_list):
+                self.input_indices[i, :len(arr)] = arr
+                self.input_mask[i, :len(arr)] = True
+        else:
+            self.input_indices = np.array([]).astype(int)
+            self.input_mask = np.array([]).astype(bool)
+            
+        if output_indices_list:
+            max_output_len = max(len(arr) for arr in output_indices_list)
+            self.output_indices = np.full((len(output_indices_list), max_output_len), _cell_types.shape[0], dtype=int)
+            self.output_mask = np.zeros((len(output_indices_list), max_output_len), dtype=bool)
+            for i, arr in enumerate(output_indices_list):
+                self.output_indices[i, :len(arr)] = arr
+                self.output_mask[i, :len(arr)] = True
+        else:
+            self.output_indices = np.array([]).astype(int)
+            self.output_mask = np.array([]).astype(bool)
+
+    def __getattr__(self, key):
+        """Override parent method to handle padding and masking for ragged arrays."""
+        activity = self.activity() if not self.keepref else self.activity
+        if activity is None:
+            return
+        
+        # Handle the special case where we need padding
+        if hasattr(self, 'output_mask') and hasattr(self, 'input_mask'):
+            # Extend activity with one extra zero-neuron for padding positions
+            if activity.shape[-1] == self.n_nodes:
+                if isinstance(activity, torch.Tensor):
+                    zeros = torch.zeros((*activity.shape[:-1], 1), dtype=activity.dtype, device=activity.device)
+                    padded_activity = torch.cat([activity, zeros], dim=-1)
+                else:
+                    padded_activity = np.concatenate([activity, np.zeros((*activity.shape[:-1], 1))], axis=-1)
+            else:
+                padded_activity = activity
+        else:
+            padded_activity = activity
+
+        if isinstance(key, list):
+            index = np.stack(list(map(lambda key: dict.__getitem__(self, key), key)))
+            slices = self._slices(len(padded_activity.shape) - 1)
+            slices += (index,)
+            return padded_activity[slices]
+        elif key == slice(None):
+            return padded_activity
+        elif key in self.unique_cell_types:
+            slices = self._slices(len(padded_activity.shape) - 1)
+            slices += (dict.__getitem__(self, key),)
+            return padded_activity[slices]
+        elif key == "output":
+            slices = self._slices(len(padded_activity.shape) - 1)
+            slices += (self.output_indices,)
+            result = padded_activity[slices]
+            # Apply masking if use_mask=True
+            if self.use_mask and hasattr(self, 'output_mask'):
+                # Expand mask to match result dimensions
+                mask_shape = [1] * (len(result.shape) - 2) + list(self.output_mask.shape)
+                expanded_mask = self.output_mask.reshape(mask_shape)
+                if isinstance(result, torch.Tensor):
+                    expanded_mask = torch.from_numpy(expanded_mask).to(result.device, dtype=result.dtype)
+                result = result * expanded_mask
+            return result
+        elif key == "input":
+            slices = self._slices(len(padded_activity.shape) - 1)
+            slices += (self.input_indices,)
+            result = padded_activity[slices]
+            # Apply masking if use_mask=True
+            if self.use_mask and hasattr(self, 'input_mask'):
+                # Expand mask to match result dimensions
+                mask_shape = [1] * (len(result.shape) - 2) + list(self.input_mask.shape)
+                expanded_mask = self.input_mask.reshape(mask_shape)
+                if isinstance(result, torch.Tensor):
+                    expanded_mask = torch.from_numpy(expanded_mask).to(result.device, dtype=result.dtype)
+                result = result * expanded_mask
+            return result
+        elif key in self.__dict__:
+            return self.__dict__[key]
+        else:
+            raise ValueError(f"{key}")
 
 
 class SourceCurrentView:

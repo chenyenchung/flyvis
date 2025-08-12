@@ -40,7 +40,7 @@ class ActivityDecoder(nn.Module):
 
     def __init__(self, connectome: ConnectomeFromAvgFilters):
         super().__init__()
-        self.dvs_channels = LayerActivity(None, connectome, use_central=False)
+        self.dvs_channels = LayerActivity(None, connectome, use_central=False, use_mask=False)
         self.num_parameters = n_params(self)
         radius = connectome.config.extent
         self.u, self.v = get_hex_coords(radius)
