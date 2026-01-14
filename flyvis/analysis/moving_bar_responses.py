@@ -11,6 +11,7 @@ from typing import Iterable, List, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import xarray as xr
 from scipy.interpolate import interp1d
 
@@ -34,6 +35,7 @@ __all__ = [
     "get_known_tuning_curves",
     "correlation_to_known_tuning_curves",
     "angular_distance_to_known",
+    "MovingBarResponsesView",
 ]
 
 
@@ -141,12 +143,14 @@ def peak_responses_angular(
         dataset, norm=norm, from_degree=from_degree, to_degree=to_degree
     )
 
-    # Make complex over angles
-    angles = peak['angle'].values
-    radians = np.deg2rad(angles)
-    # Expand dimensions to match broadcasting
-    radians = radians[np.newaxis, :, np.newaxis]
-    complex_peak = peak * np.exp(1j * radians)
+    # Make complex over angles using xarray coordinate-aware operations
+    angles_rad = np.deg2rad(peak['angle'])
+    exp_factor = xr.apply_ufunc(
+        lambda x: np.exp(1j * x),
+        angles_rad,
+        dask='allowed'
+    )
+    complex_peak = peak * exp_factor
 
     return complex_peak
 
@@ -631,6 +635,139 @@ def simple_angle_distance(
 
     # map distances between 0 and pi to 0 and upper
     return y / np.pi * upper
+
+
+class MovingBarResponsesView:
+    """A view of moving bar responses with analysis methods.
+    
+    This class wraps an xarray Dataset containing moving bar responses
+    and provides additional analysis methods for ensemble-level summaries.
+    
+    Args:
+        dataset: The xarray Dataset containing moving bar responses.
+        
+    Attributes:
+        dataset: The underlying xarray Dataset.
+    """
+    
+    def __init__(self, dataset: xr.Dataset):
+        self.dataset = dataset
+        
+    def __getattr__(self, name):
+        """Delegate attribute access to the underlying dataset."""
+        return getattr(self.dataset, name)
+    
+    def __getitem__(self, key):
+        """Delegate item access to the underlying dataset."""
+        return self.dataset[key]
+    
+    def peak_responses(self, norm: xr.DataArray = None, from_degree: float = None, 
+                      to_degree: float = None) -> xr.DataArray:
+        """Compute peak responses from rectified voltages, optionally normalized.
+        
+        Args:
+            norm: Normalization array.
+            from_degree: Starting degree for masking.
+            to_degree: Ending degree for masking.
+            
+        Returns:
+            Peak responses with reshaped and transposed dimensions.
+        """
+        return peak_responses(self.dataset, norm=norm, from_degree=from_degree, 
+                            to_degree=to_degree)
+    
+    def peak_responses_angular(self, norm: xr.DataArray = None, from_degree: float = None,
+                              to_degree: float = None) -> xr.DataArray:
+        """Compute peak responses and make them complex over angles.
+        
+        Args:
+            norm: Normalization array.
+            from_degree: Starting degree for masking.
+            to_degree: Ending degree for masking.
+            
+        Returns:
+            Complex-valued peak responses.
+        """
+        return peak_responses_angular(self.dataset, norm=norm, from_degree=from_degree,
+                                    to_degree=to_degree)
+        
+    def summarize_df(self, cell_types=None) -> pd.DataFrame:
+        """Create a summary DataFrame with metrics for each neuron in the ensemble.
+        
+        Args:
+            cell_types: List of cell types to include. Defaults to T4/T5 motion-sensitive types.
+        
+        Returns:
+            DataFrame where each row is a neuron at a specific intensity with computed metrics:
+            - network_id: Network identifier
+            - cell_type: Cell type of the neuron
+            - intensity: Stimulus intensity (0 or 1)
+            - direction_selectivity_index: DSI values
+            - correlation_to_known_tuning_curves: Correlation to known tuning curves
+            - angular_distance_to_known: Angular distance to known preferred directions
+        """
+        if cell_types is None:
+            cell_types = ['T4a', 'T4b', 'T4c', 'T4d', 'T5a', 'T5b', 'T5c', 'T5d']
+        
+        # Currently only supports the complete T4/T5 set due to groundtruth alignment requirements
+        supported_cell_types = ['T4a', 'T4b', 'T4c', 'T4d', 'T5a', 'T5b', 'T5c', 'T5d']
+        if set(cell_types) != set(supported_cell_types):
+            raise ValueError(f"Currently only supports the complete T4/T5 set: {supported_cell_types}. "
+                           f"Got: {cell_types}")
+        
+        # Get network IDs from the dataset
+        network_ids = self.dataset.coords.get('network_id', None)
+        if network_ids is None:
+            raise ValueError("Dataset must have 'network_id' coordinate for ensemble analysis")
+            
+        results = []
+        
+        for network_id in network_ids:
+            # Select data for this specific network
+            network_data = self.dataset.sel(network_id=network_id)
+            
+            # Get cell types for this network
+            network_cell_types = network_data.coords['cell_type'].values
+            
+            # Filter neurons by specified cell types
+            cell_type_mask = np.isin(network_cell_types, cell_types)
+            if not cell_type_mask.any():
+                continue  # Skip if no neurons of specified types
+            
+            # Filter network data to only include specified cell types
+            filtered_neurons = np.where(cell_type_mask)[0]
+            network_data_filtered = network_data.isel(neuron=filtered_neurons)
+            
+            # Compute metrics for filtered data
+            dsi = direction_selectivity_index(network_data_filtered)
+            tuning_corr = correlation_to_known_tuning_curves(network_data_filtered)
+            preferred_dirs = preferred_direction(network_data_filtered)
+            angular_dist = angular_distance_to_known(preferred_dirs)
+            
+            # Get filtered cell types
+            filtered_cell_types = network_data_filtered.coords['cell_type'].values
+            
+            # Iterate over neurons and intensities
+            for neuron_idx in range(len(filtered_neurons)):
+                neuron_cell_type = filtered_cell_types[neuron_idx]
+                
+                for intensity in [0, 1]:
+                    # Extract per-neuron, per-intensity values
+                    row_data = {
+                        'network_id': str(network_id.values),
+                        'cell_type': neuron_cell_type,
+                        'intensity': intensity,
+                        'direction_selectivity_index': float(dsi.isel(neuron=neuron_idx, intensity=intensity)),
+                        'correlation_to_known_tuning_curves': float(tuning_corr.isel(neuron=neuron_idx, intensity=intensity)),
+                        'angular_distance_to_known': float(angular_dist.isel(neuron=neuron_idx)),
+                    }
+                    
+                    results.append(row_data)
+        
+        # Create DataFrame
+        df = pd.DataFrame(results)
+        
+        return df
 
 
 def plot_angular_tuning(

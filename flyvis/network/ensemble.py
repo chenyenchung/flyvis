@@ -35,6 +35,7 @@ from tqdm.auto import tqdm
 
 import flyvis
 from flyvis.analysis import stimulus_responses, stimulus_responses_currents
+from flyvis.analysis.moving_bar_responses import MovingBarResponsesView
 from flyvis.analysis.clustering import (
     GaussianMixtureClustering,
     compute_umap_and_clustering,
@@ -739,9 +740,10 @@ class Ensemble(dict):
 
     @wraps(stimulus_responses.moving_bar_responses)
     @context_aware_cache(context=lambda self: (self.names))
-    def moving_bar_responses(self, *args, **kwargs) -> xr.Dataset:
+    def moving_bar_responses(self, *args, **kwargs) -> MovingBarResponsesView:
         """Generate moving bar responses."""
-        return stimulus_responses.moving_bar_responses(self, *args, **kwargs)
+        dataset = stimulus_responses.moving_bar_responses(self, *args, **kwargs)
+        return MovingBarResponsesView(dataset)
 
     @wraps(stimulus_responses.naturalistic_stimuli_responses)
     @context_aware_cache(context=lambda self: (self.names))
