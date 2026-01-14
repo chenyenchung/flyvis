@@ -588,33 +588,94 @@ class MultiTaskSolver:
             decoder: Recover decoder parameters.
             optimizer: Recover optimizer parameters.
             penalty: Recover penalty parameters.
-            checkpoint: Index of the checkpoint to recover.
-            validation_subdir: Name of the subdir to base the best checkpoint on.
-            loss_file_name: Name of the loss to base the best checkpoint on.
+            checkpoint: Checkpoint to recover. Can be:
+                - "best": Use the checkpoint with the lowest validation loss
+                - -1: Use the last (most recent) checkpoint
+                - int >= 0: Use the checkpoint at the specified index in the list
+            validation_subdir: Name of the subdir to base the best checkpoint on
+                (used when checkpoint="best").
+            loss_file_name: Name of the loss to base the best checkpoint on
+                (used when checkpoint="best").
             strict: Whether to load the state dict of the decoders strictly.
             force: Force recovery of checkpoint if _curr_chkpt_ind is already
                 the same as the checkpoint index.
         """
-        checkpoints = resolve_checkpoints(
-            self.dir, checkpoint, validation_subdir, loss_file_name
-        )
+        # Get all available checkpoints
+        all_checkpoints = resolve_checkpoints(self.dir)
 
-        if checkpoint.index is None or not any((network, decoder, optimizer, penalty)):
-            logging.info("No checkpoint found. Continuing with initialized parameters.")
+        # Early return if no checkpoints exist
+        if len(all_checkpoints.indices) == 0:
+            if not any((network, decoder, optimizer, penalty)):
+                logging.info("No checkpoint found. Continuing with initialized parameters.")
+                return
+            logging.warning("No checkpoints found. Cannot recover state.")
             return
 
-        if checkpoints.index == self._curr_chkpt_ind and not force:
+        # Resolve which specific checkpoint to load
+        checkpoint_path = None
+        checkpoint_index = None
+
+        try:
+            if checkpoint == "best":
+                # Find the best checkpoint based on validation loss
+                from flyvis.utils.chkpt_utils import best_checkpoint_default_fn
+
+                checkpoint_path = best_checkpoint_default_fn(
+                    self.dir.path,
+                    validation_subdir=validation_subdir,
+                    loss_file_name=loss_file_name,
+                )
+                # Find the index of this checkpoint in the list
+                for idx, path in zip(all_checkpoints.indices, all_checkpoints.paths):
+                    if path == checkpoint_path:
+                        checkpoint_index = idx
+                        break
+            elif checkpoint == -1:
+                # Use the last checkpoint
+                checkpoint_index = all_checkpoints.indices[-1]
+                checkpoint_path = all_checkpoints.paths[-1]
+            elif isinstance(checkpoint, int) and checkpoint >= 0:
+                # Use the checkpoint at the specified position in the list
+                if checkpoint < len(all_checkpoints.indices):
+                    checkpoint_index = all_checkpoints.indices[checkpoint]
+                    checkpoint_path = all_checkpoints.paths[checkpoint]
+                else:
+                    logging.warning(
+                        f"Checkpoint index {checkpoint} out of range. "
+                        f"Only {len(all_checkpoints.indices)} checkpoints available."
+                    )
+                    return
+            else:
+                logging.warning(f"Invalid checkpoint specification: {checkpoint}")
+                return
+        except (FileNotFoundError, IndexError, ValueError) as e:
+            logging.warning(f"Could not resolve checkpoint {checkpoint}: {e}")
+            return
+
+        # Validate that we successfully resolved a checkpoint
+        if checkpoint_path is None or checkpoint_index is None:
+            logging.warning(f"Could not find checkpoint: {checkpoint}")
+            return
+
+        # Check if already at this checkpoint (unless forcing)
+        if checkpoint_index == self._curr_chkpt_ind and not force:
             logging.info("Checkpoint already recovered.")
+            return
+
+        # Check if nothing to recover
+        if not any((network, decoder, optimizer, penalty)):
+            logging.info("No modules specified for recovery.")
             return
 
         # Set the current and last checkpoint index. New checkpoints incrementally
         # increase the last checkpoint index.
-        self._last_chkpt_ind = checkpoints.indices[-1]
-        self._curr_chkpt_ind = checkpoints.index
+        if all_checkpoints.indices:
+            self._last_chkpt_ind = all_checkpoints.indices[-1]
+        self._curr_chkpt_ind = checkpoint_index
 
         # Load checkpoint data.
-        state_dict = torch.load(checkpoints.path)
-        logging.info(f"Checkpoint {checkpoints.path} loaded.")
+        state_dict = torch.load(checkpoint_path)
+        logging.info(f"Checkpoint {checkpoint_path} loaded.")
 
         self.iteration = state_dict.get("iteration", None)
 
