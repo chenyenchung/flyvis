@@ -1,8 +1,9 @@
 import logging
 import warnings
+import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Tuple, Union, Any, Optional
 
 import numpy as np
 import torch
@@ -165,9 +166,9 @@ class Checkpoints:
 
     def __repr__(self):
         return (
-            f"Checkpoints(\n"
-            f"  indices={repr(self.indices)},\n"
-            f"  paths={repr(self.paths)},\n"
+            f"Checkpoints("
+            f"  indices={repr(self.indices)},"
+            f"  paths={repr(self.paths)},"
             f")"
         )
 
@@ -189,7 +190,8 @@ def resolve_checkpoints(
 
 
 def checkpoint_index_to_path_map(
-    path: Path, glob: str = "chkpt_*"
+    path: Path,
+    glob: str = "chkpt_*",
 ) -> Tuple[List[int], List[Path]]:
     """
     Returns all numerical identifiers and paths to checkpoints stored in path.
@@ -261,6 +263,146 @@ def check_loss_name(loss_folder, loss_file_name: str) -> str:
         )
         loss_file_name = "loss"
     return loss_file_name
+
+
+def atomic_torch_save(obj: Any, path: Union[str, Path]) -> None:
+    """
+    Saves a torch object to a file atomically using a marker file.
+    Writes to a temp file first, renames it, then creates a .success marker.
+    This is robust for FUSE/Network filesystems where rename might not be atomic.
+
+    Args:
+        obj: Object to save.
+        path: Destination path.
+    """
+    path = Path(path)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    success_marker = path.with_suffix(path.suffix + ".success")
+
+    try:
+        # Write data to temp file
+        torch.save(obj, tmp_path)
+        
+        # Ensure data is written to disk/network
+        if hasattr(os, "fsync"):
+            try:
+                with open(tmp_path, "rb") as f:
+                    os.fsync(f.fileno())
+            except OSError:
+                pass  # fsync might not be supported on all FS
+
+        # Rename to final filename (Best effort atomic on FUSE)
+        os.replace(tmp_path, path)
+        
+        # Create success marker
+        success_marker.touch()
+        
+    except Exception as e:
+        if tmp_path.exists():
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise e
+
+
+def is_valid_checkpoint(path: Path) -> bool:
+    """
+    Checks if a checkpoint file is valid.
+    Requires a corresponding .success marker file to exist.
+    If marker exists, also attempts to load to verify integrity.
+
+    Args:
+        path: Path to the checkpoint file.
+
+    Returns:
+        True if the checkpoint is valid, False otherwise.
+    """
+    path = Path(path)
+    success_marker = path.with_suffix(path.suffix + ".success")
+    
+    # 1. Check for success marker
+    if not success_marker.exists():
+        return False
+        
+    # 2. Verify integrity by loading
+    try:
+        # map_location='cpu' avoids loading to GPU, faster for validation
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=FutureWarning)
+            torch.load(path, map_location="cpu", weights_only=False)
+        return True
+    except Exception:
+        return False
+
+
+def find_last_good_checkpoint(
+    checkpoint_dir: Path, glob: str = "chkpt_*"
+) -> Optional[Path]:
+    """
+    Finds the latest valid checkpoint.
+    Iterates backwards from newest file, validating each.
+
+    Args:
+        checkpoint_dir: Directory containing checkpoints.
+        glob: Glob pattern for checkpoint files.
+
+    Returns:
+        Path to the last valid checkpoint, or None if none found.
+    """
+    _, paths = checkpoint_index_to_path_map(checkpoint_dir, glob)
+
+    # Iterate backwards (newest first)
+    for path in reversed(paths):
+        if is_valid_checkpoint(path):
+            return path
+        else:
+            logger.warning(f"Found incomplete/corrupted checkpoint at {path}, skipping.")
+
+    return None
+
+
+def purge_temporary_checkpoints(checkpoint_dir: Path) -> None:
+    """
+    Removes temporary files and orphan checkpoints (missing .success marker).
+
+    Args:
+        checkpoint_dir: Directory containing checkpoints.
+    """
+    if not checkpoint_dir.exists():
+        return
+
+    # 1. Remove .tmp files
+    for tmp_file in checkpoint_dir.glob("*.tmp"):
+        try:
+            logger.info(f"Purging temporary checkpoint file: {tmp_file}")
+            os.remove(tmp_file)
+        except OSError as e:
+            logger.warning(f"Failed to delete {tmp_file}: {e}")
+            
+    # 2. Remove orphan checkpoints (no .success marker)
+    # Note: We need to be careful not to delete a file that is currently being written.
+    # The atomic_torch_save flow (tmp -> rename -> marker) means there is a small window
+    # where the file exists without a marker.
+    # However, this function is typically called at startup (recovery), where no active
+    # writing should be happening.
+    
+    # We scan for chkpt_* files (excluding markers themselves)
+    # Using the same glob pattern logic as checkpoint_index_to_path_map
+    _, paths = checkpoint_index_to_path_map(checkpoint_dir, glob="chkpt_*")
+    
+    for path in paths:
+        # If it's a marker file itself, skip (though glob should filter it if strictly chkpt_*)
+        if path.suffix == ".success":
+            continue
+            
+        success_marker = path.with_suffix(path.suffix + ".success")
+        if not success_marker.exists():
+            try:
+                logger.info(f"Purging orphan checkpoint (no success marker): {path}")
+                os.remove(path)
+            except OSError as e:
+                logger.warning(f"Failed to delete {path}: {e}")
 
 
 if __name__ == "__main__":

@@ -15,6 +15,9 @@ from flyvis.network.directories import NetworkDir
 from flyvis.network.network import Network
 from flyvis.task.tasks import Task
 from flyvis.utils.chkpt_utils import (
+    atomic_torch_save,
+    find_last_good_checkpoint,
+    purge_temporary_checkpoints,
     recover_decoder,
     recover_network,
     recover_optimizer,
@@ -455,7 +458,7 @@ class MultiTaskSolver:
         }
         if hasattr(self, "penalty"):
             chkpt.update(self.penalty._chkpt())
-        torch.save(chkpt, self.checkpoint_path / f"chkpt_{self._last_chkpt_ind:05}")
+        atomic_torch_save(chkpt, self.checkpoint_path / f"chkpt_{self._last_chkpt_ind:05}")
 
         # Append chkpt index.
         self.checkpoints.append(self._last_chkpt_ind)
@@ -603,6 +606,9 @@ class MultiTaskSolver:
         # Get all available checkpoints
         all_checkpoints = resolve_checkpoints(self.dir)
 
+        # Purge temporary checkpoints from previous interrupted runs
+        purge_temporary_checkpoints(self.dir.chkpts.path)
+
         # Early return if no checkpoints exist
         if len(all_checkpoints.indices) == 0:
             if not any((network, decoder, optimizer, penalty)):
@@ -631,9 +637,26 @@ class MultiTaskSolver:
                         checkpoint_index = idx
                         break
             elif checkpoint == -1:
-                # Use the last checkpoint
-                checkpoint_index = all_checkpoints.indices[-1]
-                checkpoint_path = all_checkpoints.paths[-1]
+                # Use the heuristic to find the last good checkpoint
+                checkpoint_path = find_last_good_checkpoint(self.dir.chkpts.path)
+                
+                if checkpoint_path:
+                    # Find the index of this checkpoint
+                    # We need to re-resolve checkpoints or search in the existing list
+                    # Since we might have skipped some bad ones at the end, the list index
+                    # might not be -1 anymore.
+                    for idx, path in zip(all_checkpoints.indices, all_checkpoints.paths):
+                        if path == checkpoint_path:
+                            checkpoint_index = idx
+                            break
+                    if checkpoint_index is None:
+                         # Fallback if path not found in resolved list (unlikely)
+                         import re
+                         checkpoint_index = int(re.findall(r"\d{1,10}", checkpoint_path.parts[-1])[0])
+                else:
+                    logging.warning("No valid checkpoint found to recover.")
+                    return
+
             elif isinstance(checkpoint, int) and checkpoint >= 0:
                 # Use the checkpoint at the specified position in the list
                 if checkpoint < len(all_checkpoints.indices):
