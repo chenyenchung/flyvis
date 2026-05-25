@@ -150,7 +150,22 @@ class NetworkDynamics:
 
 
 class PPNeuronIGRSynapses(NetworkDynamics):
-    """Passive point neurons with instantaneous graded release synapses."""
+    """Passive point neurons with instantaneous graded release synapses.
+
+    Args:
+        activation: Dictionary specifying activation function type and parameters.
+        edge_mask: Optional tensor of shape (n_edges,) to mask edge weights.
+            Values of 0 ablate edges, values of 1 keep them. Applied after
+            weight computation in write_derived_params.
+    """
+
+    def __init__(
+        self,
+        activation: Dict[str, str] = {"type": "relu"},
+        edge_mask: torch.Tensor = None,
+    ):
+        super().__init__(activation)
+        self.edge_mask = edge_mask
 
     def write_derived_params(
         self, params: AutoDeref[str, AutoDeref[str, RefTensor]], **kwargs
@@ -165,6 +180,11 @@ class PPNeuronIGRSynapses(NetworkDynamics):
         params.edges.weight = (
             params.edges.sign * params.edges.syn_count * params.edges.syn_strength
         )
+        # Apply edge mask if present (for ablated networks)
+        if self.edge_mask is not None:
+            params.edges.weight = params.edges.weight * self.edge_mask.to(
+                params.edges.weight.device
+            )
 
     def write_initial_state(
         self,

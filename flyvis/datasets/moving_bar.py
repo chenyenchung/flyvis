@@ -190,7 +190,7 @@ class MovingBar(StimulusDataset):
             )  # t_stim assumes spacing of 1 corresponding to 2.25 deg
             self.offsets = offsets
         self.intensities = np.array(intensities)
-        self.speeds = np.array(speeds)
+        self.speeds = np.array(speeds, dtype=float)
         self.bg_intensity = 0.5
         self.n_bars = 1
         self.bar_loc_horizontal = bar_loc_horizontal

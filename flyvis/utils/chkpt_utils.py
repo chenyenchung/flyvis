@@ -40,6 +40,14 @@ def recover_network(
         )
     else:
         logging.warning("Could not recover network state.")
+
+    # Apply edge mask if present in checkpoint (for ablated networks)
+    edge_mask = get_from_state_dict(state_dict, "edge_mask")
+    if edge_mask is not None:
+        network.dynamics.edge_mask = edge_mask
+        ablation_info = get_from_state_dict(state_dict, "ablation_info") or {}
+        logging.info("Applied edge ablation mask: %s", ablation_info)
+
     return network
 
 
