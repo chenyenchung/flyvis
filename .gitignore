@@ -190,5 +190,11 @@ dev
 *.ext3
 *.sif
 
+# Nextflow scratch/cache artifacts
+.nextflow/
+.nextflow.log*
+.nfsc*
+work/
+
 # Exploration
 ipynb

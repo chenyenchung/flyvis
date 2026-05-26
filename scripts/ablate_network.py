@@ -32,6 +32,31 @@ from flyvis import NetworkView
 from flyvis.utils.chkpt_utils import atomic_torch_save
 
 
+STALE_OUTPUTS = (
+    "__cache__",
+    "training",
+    "training_batch",
+    "validation",
+    "validation_ablation",
+    "validation_batch",
+    "validation_loss.h5",
+)
+
+
+def remove_path(path):
+    """Remove an existing file, symlink, or directory."""
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def clean_stale_outputs(output_path):
+    """Remove stale outputs that must be recomputed for an ablated checkpoint."""
+    for name in STALE_OUTPUTS:
+        remove_path(output_path / name)
+
+
 def create_ablation_mask(network, target_type, stride_u=2, stride_v=1):
     """Create mask for position-specific edge ablation.
 
@@ -53,8 +78,8 @@ def create_ablation_mask(network, target_type, stride_u=2, stride_v=1):
         t.decode() if isinstance(t, bytes) else t
         for t in edges.target_type[:]
     ])
-    target_u = edges.target_u[:]
-    target_v = edges.target_v[:]
+    target_u = np.asarray(edges.target_u[:])
+    target_v = np.asarray(edges.target_v[:])
 
     # Find edges to the target type
     type_mask = target_types == target_type
@@ -103,6 +128,7 @@ def ablate_and_save(input_path, output_path, target_type, stride_u=2, stride_v=1
 
     # Create output directory structure
     output_path.mkdir(parents=True, exist_ok=True)
+    clean_stale_outputs(output_path)
     chkpts_dir = output_path / "chkpts"
     chkpts_dir.mkdir(exist_ok=True)
 
@@ -138,14 +164,10 @@ def ablate_and_save(input_path, output_path, target_type, stride_u=2, stride_v=1
         f.create_dataset("data", data=[0])
     with h5py.File(output_path / "best_chkpt_index.h5", "w") as f:
         f.create_dataset("data", data=0)
-
-    # Copy validation directory if exists (for reference)
-    if (input_path / "validation").exists():
-        shutil.copytree(
-            input_path / "validation",
-            output_path / "validation",
-            dirs_exist_ok=True
-        )
+    with h5py.File(output_path / "chkpt_iter.h5", "w") as f:
+        f.create_dataset("data", data=orig_chkpt.get("iteration", -1))
+    with h5py.File(output_path / "dt.h5", "w") as f:
+        f.create_dataset("data", data=orig_chkpt.get("dt", 0.02))
 
     return output_path
 
